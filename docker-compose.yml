@@ -1,0 +1,438 @@
+version: '3.8'
+
+services:
+  # SOC Lab Portal - Main Web Interface
+  portal:
+    build:
+      context: ./portal
+      dockerfile: Dockerfile
+    container_name: soc-lab-portal
+    ports:
+      - "5500:80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./portal/logs:/app/logs
+    environment:
+      - PORT=80
+      - HOST_IP=${HOST_IP:-localhost}
+    restart: unless-stopped
+    networks:
+      - soc-lab
+
+  # Portainer - Container Management
+  portainer:
+    container_name: soc-lab-portainer
+    image: portainer/portainer-ce:latest
+    restart: unless-stopped
+    ports:
+      - "9443:9443"
+      - "8001:8000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+    networks:
+      - soc-lab
+
+  # Wazuh - SIEM & HIDS
+  wazuh-manager:
+    container_name: soc-lab-wazuh-manager
+    image: wazuh/wazuh-manager:4.7.0
+    restart: unless-stopped
+    ports:
+      - "1514:1514"
+      - "1515:1515"
+      - "514:514/udp"
+      - "55000:55000"
+    volumes:
+      - wazuh_api_configuration:/var/ossec/api/configuration
+      - wazuh_etc:/var/ossec/etc
+      - wazuh_logs:/var/ossec/logs
+      - wazuh_queue:/var/ossec/queue
+      - wazuh_var_multigroups:/var/ossec/var/multigroups
+      - wazuh_integrations:/var/ossec/integrations
+      - wazuh_active_response:/var/ossec/active-response/bin
+      - wazuh_agentless:/var/ossec/agentless
+      - wazuh_wodles:/var/ossec/wodles
+      - wazuh_filebeat_etc:/etc/filebeat
+      - wazuh_filebeat_var:/var/lib/filebeat
+      - wazuh_dashboard_cert:/etc/ssl/certs
+    networks:
+      - soc-lab
+
+  wazuh-indexer:
+    container_name: soc-lab-wazuh-indexer
+    image: wazuh/wazuh-indexer:4.7.0
+    restart: unless-stopped
+    ports:
+      - "9200:9200"
+    environment:
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - wazuh-indexer-data:/var/lib/wazuh-indexer
+      - wazuh-indexer-certs:/usr/share/wazuh-indexer/certs
+    networks:
+      - soc-lab
+
+  wazuh-dashboard:
+    container_name: soc-lab-wazuh-dashboard
+    image: wazuh/wazuh-dashboard:4.7.0
+    restart: unless-stopped
+    ports:
+      - "443:5601"
+    environment:
+      - WAZUH_INDEXER_URL=https://wazuh-indexer:9200
+      - WAZUH_API_URL=https://wazuh-manager:55000
+    volumes:
+      - wazuh-dashboard-certs:/usr/share/wazuh-dashboard/certs
+      - wazuh-dashboard-config:/usr/share/wazuh-dashboard/config
+      - wazuh-dashboard-data:/usr/share/wazuh-dashboard/data
+    depends_on:
+      - wazuh-indexer
+    networks:
+      - soc-lab
+
+  # Suricata - NIDS
+  suricata:
+    container_name: soc-lab-suricata
+    image: jasonish/suricata:latest
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_NICE
+    volumes:
+      - ./suricata/config:/etc/suricata
+      - ./suricata/logs:/var/log/suricata
+      - ./suricata/rules:/var/lib/suricata/rules
+    command: -i eth0 -v
+    networks:
+      - soc-lab
+
+  # EveBox - Suricata Event Management
+  evebox:
+    container_name: soc-lab-evebox
+    image: jasonish/evebox:latest
+    restart: unless-stopped
+    ports:
+      - "5636:5636"
+    volumes:
+      - ./suricata/logs:/var/log/suricata:ro
+      - evebox-data:/var/lib/evebox
+    command: ["-e", "/var/log/suricata/eve.json", "--host", "0.0.0.0", "--port", "5636"]
+    networks:
+      - soc-lab
+
+  # Velociraptor - DFIR
+  velociraptor:
+    container_name: soc-lab-velociraptor
+    image: velox/velociraptor:latest
+    restart: unless-stopped
+    ports:
+      - "8889:8889"
+      - "8000:8000"
+    volumes:
+      - velociraptor-data:/velociraptor
+      - ./velociraptor/config:/etc/velociraptor
+    command: ["--config", "/etc/velociraptor/server.config.yaml", "frontend", "--nobrowser"]
+    networks:
+      - soc-lab
+
+  # Arkime - Network Analysis
+  arkime:
+    container_name: soc-lab-arkime
+    image: arkime/arkime:latest
+    restart: unless-stopped
+    ports:
+      - "8005:8005"
+    volumes:
+      - arkime-data:/data
+      - ./arkime/config:/opt/arkime/etc
+    environment:
+      - ARKIME_INTERFACE=eth0
+      - ARKIME_ELASTICSEARCH=http://localhost:9200
+    networks:
+      - soc-lab
+
+  # MISP - Threat Intelligence
+  misp:
+    container_name: soc-lab-misp
+    image: coolacid/misp-docker:core-latest
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+      - "8443:443"
+    volumes:
+      - misp-data:/var/www/MISP
+    environment:
+      - MYSQL_HOST=misp-db
+      - MYSQL_DATABASE=misp
+      - MYSQL_USER=misp
+      - MYSQL_PASSWORD=misp
+      - MISP_ADMIN_EMAIL=admin@admin.test
+      - MISP_ADMIN_PASSPHRASE=admin
+      - MISP_BASEURL=https://localhost:8443
+      - POSTFIX_RELAY_HOST=misp-postfix
+      - TIMEZONE=Europe/Amsterdam
+    depends_on:
+      - misp-db
+      - misp-redis
+    networks:
+      - soc-lab
+
+  misp-db:
+    container_name: soc-lab-misp-db
+    image: mysql:8.0
+    restart: unless-stopped
+    volumes:
+      - misp-mysql-data:/var/lib/mysql
+    environment:
+      - MYSQL_DATABASE=misp
+      - MYSQL_USER=misp
+      - MYSQL_PASSWORD=misp
+      - MYSQL_ROOT_PASSWORD=misp
+    networks:
+      - soc-lab
+
+  misp-redis:
+    container_name: soc-lab-misp-redis
+    image: redis:alpine
+    restart: unless-stopped
+    networks:
+      - soc-lab
+
+  # MITRE ATT&CK Navigator
+  mitre-navigator:
+    container_name: soc-lab-mitre-navigator
+    build:
+      context: ./mitre-navigator
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "7013:4200"
+    networks:
+      - soc-lab
+
+  # Shuffle - SOAR
+  shuffle-backend:
+    container_name: soc-lab-shuffle-backend
+    image: frikky/shuffle:alpine
+    restart: unless-stopped
+    ports:
+      - "5001:5001"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - shuffle-data:/shuffle-files
+    environment:
+      - SHUFFLE_APP_DOWNLOAD_LOCATION=https://github.com/frikky/shuffle-apps
+    networks:
+      - soc-lab
+
+  shuffle-frontend:
+    container_name: soc-lab-shuffle-frontend
+    image: frikky/shuffle-frontend:alpine
+    restart: unless-stopped
+    ports:
+      - "3443:80"
+    environment:
+      - BACKEND_HOSTNAME=shuffle-backend:5001
+    depends_on:
+      - shuffle-backend
+    networks:
+      - soc-lab
+
+  shuffle-orborus:
+    container_name: soc-lab-shuffle-orborus
+    image: frikky/shuffle-orborus:alpine
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - SHUFFLE_APP_DOWNLOAD_LOCATION=https://github.com/frikky/shuffle-apps
+      - ORG_ID=Shuffle
+      - ENVIRONMENT_NAME=Shuffle
+    depends_on:
+      - shuffle-backend
+    networks:
+      - soc-lab
+
+  # TheHive - Incident Response
+  thehive:
+    container_name: soc-lab-thehive
+    image: strangebee/thehive:5.2
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    volumes:
+      - thehive-data:/data
+      - ./thehive/config:/etc/thehive
+    environment:
+      - JAVA_OPTS=-Xms512m -Xmx1g
+    depends_on:
+      - thehive-cassandra
+      - thehive-elasticsearch
+    networks:
+      - soc-lab
+
+  thehive-cassandra:
+    container_name: soc-lab-thehive-cassandra
+    image: cassandra:4.1
+    restart: unless-stopped
+    volumes:
+      - thehive-cassandra-data:/var/lib/cassandra
+    environment:
+      - CASSANDRA_CLUSTER_NAME=TheHive
+    networks:
+      - soc-lab
+
+  thehive-elasticsearch:
+    container_name: soc-lab-thehive-elasticsearch
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.9
+    restart: unless-stopped
+    volumes:
+      - thehive-elasticsearch-data:/usr/share/elasticsearch/data
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    networks:
+      - soc-lab
+
+  # Cortex - Observable Analysis
+  cortex:
+    container_name: soc-lab-cortex
+    image: thehiveproject/cortex:3.1.7
+    restart: unless-stopped
+    ports:
+      - "9001:9001"
+    volumes:
+      - cortex-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - JOB_DIRECTORY=/data/jobs
+    networks:
+      - soc-lab
+
+  # CyberChef
+  cyberchef:
+    container_name: soc-lab-cyberchef
+    image: mpepping/cyberchef:latest
+    restart: unless-stopped
+    ports:
+      - "7020:8000"
+    networks:
+      - soc-lab
+
+  # FleetDM - Device Management
+  fleet:
+    container_name: soc-lab-fleet
+    image: fleetdm/fleet:latest
+    restart: unless-stopped
+    ports:
+      - "8412:8412"
+    command: sh -c "/usr/bin/fleet prepare db --mysql_address=fleet-mysql:3306 --mysql_database=fleet --mysql_username=fleet --mysql_password=fleet123 && /usr/bin/fleet serve --mysql_address=fleet-mysql:3306 --mysql_database=fleet --mysql_username=fleet --mysql_password=fleet123 --redis_address=fleet-redis:6379 --server_address=0.0.0.0:8412"
+    depends_on:
+      - fleet-mysql
+      - fleet-redis
+    networks:
+      - soc-lab
+
+  fleet-mysql:
+    container_name: soc-lab-fleet-mysql
+    image: mysql:8.0
+    restart: unless-stopped
+    volumes:
+      - fleet-mysql-data:/var/lib/mysql
+    environment:
+      - MYSQL_DATABASE=fleet
+      - MYSQL_USER=fleet
+      - MYSQL_PASSWORD=fleet123
+      - MYSQL_ROOT_PASSWORD=fleet123
+    networks:
+      - soc-lab
+
+  fleet-redis:
+    container_name: soc-lab-fleet-redis
+    image: redis:alpine
+    restart: unless-stopped
+    networks:
+      - soc-lab
+
+  # Caldera - Adversary Emulation
+  caldera:
+    container_name: soc-lab-caldera
+    image: mitre/caldera:latest
+    restart: unless-stopped
+    ports:
+      - "8888:8888"
+      - "8443:8443"
+    volumes:
+      - caldera-data:/usr/src/app/data
+      - ./caldera/config:/usr/src/app/conf
+    environment:
+      - CALDERA_HOST=0.0.0.0
+      - CALDERA_PORT=8888
+    networks:
+      - soc-lab
+
+  # Wireshark - Web-based
+  wireshark:
+    container_name: soc-lab-wireshark
+    image: lscr.io/linuxserver/wireshark:latest
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    cap_add:
+      - NET_ADMIN
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - ./wireshark/captures:/config/captures
+    networks:
+      - soc-lab
+
+networks:
+  soc-lab:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  portainer_data:
+  wazuh_api_configuration:
+  wazuh_etc:
+  wazuh_logs:
+  wazuh_queue:
+  wazuh_var_multigroups:
+  wazuh_integrations:
+  wazuh_active_response:
+  wazuh_agentless:
+  wazuh_wodles:
+  wazuh_filebeat_etc:
+  wazuh_filebeat_var:
+  wazuh_dashboard_cert:
+  wazuh-indexer-data:
+  wazuh-indexer-certs:
+  wazuh-dashboard-certs:
+  wazuh-dashboard-config:
+  wazuh-dashboard-data:
+  evebox-data:
+  velociraptor-data:
+  arkime-data:
+  misp-data:
+  misp-mysql-data:
+  shuffle-data:
+  thehive-data:
+  thehive-cassandra-data:
+  thehive-elasticsearch-data:
+  cortex-data:
+  fleet-mysql-data:
+  caldera-data:
